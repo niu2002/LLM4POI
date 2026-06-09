@@ -4,3 +4,4 @@ logs/
 outputs/
 __MACOSX/
 *.DS_Store
+.idea/

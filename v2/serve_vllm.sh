@@ -8,10 +8,12 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8100}"
 DTYPE="${DTYPE:-bfloat16}"
 ENABLE_LORA="${ENABLE_LORA:-0}"
-TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-4}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-24000}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-65536}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-131072}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
+DRY_RUN="${DRY_RUN:-0}"
 
 if [[ -z "${BASE_MODEL_DIR}" ]]; then
   cat <<'EOF'
@@ -39,6 +41,7 @@ ARGS=(
   --dtype "${DTYPE}"
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}"
   --max-model-len "${MAX_MODEL_LEN}"
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --host "${HOST}"
   --port "${PORT}"
 )
@@ -53,6 +56,14 @@ fi
 
 if [[ "${ENABLE_LORA}" == "1" ]]; then
   ARGS+=( --enable-lora --lora-modules "${SERVE_NAME}=${ADAPTER_DIR}" )
+fi
+
+printf '[info] command: python -m vllm.entrypoints.openai.api_server'
+printf ' %q' "${ARGS[@]}"
+printf '\n'
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  exit 0
 fi
 
 python -m vllm.entrypoints.openai.api_server "${ARGS[@]}"

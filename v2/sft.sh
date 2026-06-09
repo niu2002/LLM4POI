@@ -5,6 +5,7 @@ MODEL_PATH="${MODEL_PATH:-}"
 MODEL_TYPE="${MODEL_TYPE:-}"
 DATASET_PATH="${DATASET_PATH:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
+DRY_RUN="${DRY_RUN:-0}"
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 TRAIN_TYPE="${TRAIN_TYPE:-full}"
@@ -14,7 +15,7 @@ NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-3}"
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-16}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
-MAX_LENGTH="${MAX_LENGTH:-12024}"
+MAX_LENGTH="${MAX_LENGTH:-32768}"
 SAVE_STEPS="${SAVE_STEPS:-5}"
 LOGGING_STEPS="${LOGGING_STEPS:-1}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
@@ -24,6 +25,7 @@ SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-2}"
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-zero3}"
 USE_LIGER_KERNEL="${USE_LIGER_KERNEL:-true}"
 ATTN_IMPL="${ATTN_IMPL:-flash_attn}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 if [[ -z "${MODEL_PATH}" || -z "${MODEL_TYPE}" || -z "${DATASET_PATH}" || -z "${OUTPUT_DIR}" ]]; then
   cat <<'EOF'
@@ -39,11 +41,17 @@ Required environment variables:
   MODEL_TYPE   ms-swift model type.
   DATASET_PATH Training dataset path accepted by swift.
   OUTPUT_DIR   Output checkpoint directory.
+
+High-memory defaults:
+  MAX_LENGTH defaults to 32768 for AMD remote runs.
+  PER_DEVICE_TRAIN_BATCH_SIZE defaults to the original v2 value 16.
+  Increase PER_DEVICE_TRAIN_BATCH_SIZE or MAX_LENGTH if memory remains unused.
 EOF
   exit 1
 fi
 
-torchrun --nproc_per_node="${NPROC_PER_NODE}" -m swift.cli.sft \
+CMD=(
+torchrun --nproc_per_node="${NPROC_PER_NODE}" -m swift.cli.sft
   --model "${MODEL_PATH}" \
   --model_type "${MODEL_TYPE}" \
   --train_type "${TRAIN_TYPE}" \
@@ -68,3 +76,20 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" -m swift.cli.sft \
   --deepspeed "${DEEPSPEED_CONFIG}" \
   --use_liger_kernel "${USE_LIGER_KERNEL}" \
   --attn_impl "${ATTN_IMPL}"
+)
+
+if [[ -n "${EXTRA_ARGS}" ]]; then
+  # shellcheck disable=SC2206
+  EXTRA_ARGS_ARRAY=(${EXTRA_ARGS})
+  CMD+=("${EXTRA_ARGS_ARRAY[@]}")
+fi
+
+printf '[info] command:'
+printf ' %q' "${CMD[@]}"
+printf '\n'
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  exit 0
+fi
+
+"${CMD[@]}"

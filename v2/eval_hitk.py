@@ -25,7 +25,7 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit("openai package is required. Install via `pip install openai`.") from exc
 
 
-POI_ID_RE = re.compile(r"\b[0-9a-fA-F]{24}\b")
+POI_ID_RE = re.compile(r"\b\d+\b")
 
 
 def load_messages(dataset_path: Path) -> List[dict]:

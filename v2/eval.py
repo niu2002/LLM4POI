@@ -161,7 +161,9 @@ async def _evaluate_one(
     pred_text = pred_text.split("<")[0]
     gold_text = gold_text.split("<")[0]
 
-    is_correct = pred_text == gold_text
+    pred_cleaned = re.sub(r'\D', '', pred_text)
+    gold_cleaned = re.sub(r'\D', '', gold_text)
+    is_correct = (pred_cleaned == gold_cleaned) and (pred_cleaned != "")
     return {
         "prompt": prompt_messages,
         "gold_response": gold_text,

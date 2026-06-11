@@ -158,6 +158,9 @@ def build_samples(
     dataset_split: str,
     history_limit: int,
 ) -> List[Dict[str, Any]]:
+    dataset_ranges = {"nyc": 4981, "tky": 7833, "ca": 9690}
+    range_val = dataset_ranges.get(dataset_name.lower(), 4981)
+
     user_template = (
         "You will be given history and current trajectory data of a user from {dataset}.\n"
         "<history>\n"
@@ -170,7 +173,7 @@ def build_samples(
         "as (time, poi_id, poi category):\n"
         "{current_section}"
         "</current>\n"
-        "Given the data, at {target_time}, which POI will user {user_id} visit?\n"
+        "Given the data, at {target_time}, which POI id will user {user_id} visit? Note that POI id is an integer in the range from 0 to {range_val}.\n"
     )
 
     samples: List[Dict[str, Any]] = []
@@ -216,6 +219,7 @@ def build_samples(
             current_section=current_text,
             user_id=user_id,
             target_time=target_row["UTCTimeOffset"].strftime("%Y-%m-%d %H:%M:%S"),
+            range_val=range_val,
         )
 
         target_poiid = str(target_row["PoiId"])

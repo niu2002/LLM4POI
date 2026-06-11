@@ -240,6 +240,28 @@ bash eval.sh
 
 If the model is still not filling VRAM during evaluation, increase `CONCURRENCY`. If vLLM reports memory pressure, reduce `MAX_NUM_SEQS` or `MAX_NUM_BATCHED_TOKENS`.
 
+## Generative Hit@K Evaluation
+
+The default `v2/eval.py` reports single-sample exact match, which is equivalent to `Hit@1` for the current generative v2 path. To estimate `Hit@1/5/10/20`, use the multi-sample evaluator:
+
+```bash
+cd v2
+
+DATASET_PATH=../datasets/nyc/llm4poi_v2/nyc_gsm8k_test_llm4poi.parquet \
+OUTPUT_PATH=../outputs/nyc_hitk_predictions.jsonl \
+MODEL_NAME=llm4poi \
+BASE_URL=http://127.0.0.1:7864/v1 \
+MAX_NEW_TOKENS=48 \
+CONCURRENCY=8 \
+TEMPERATURE=0.7 \
+TOP_P=0.95 \
+NUM_RETURN_SEQUENCES=20 \
+K_VALUES=1,5,10,20 \
+bash eval_hitk.sh
+```
+
+This is a generative `Hit@K`: each request asks the model for multiple sampled answers and checks whether the gold POI id appears in the first `K` generations. It is useful for the v2 serving path, but it is not the same as a full candidate-pool logprob reranker.
+
 ## Model Size Guidance
 
 With 192 GB VRAM, you should be able to run a much larger model than the local 2B Windows test model, assuming ROCm, PyTorch, ms-swift, and vLLM are installed correctly. Send the remote model path and model type when ready; the main variables to tune will be:

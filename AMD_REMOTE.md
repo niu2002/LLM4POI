@@ -40,14 +40,15 @@ If the live machine differs from this snapshot, prefer the live machine. The goa
   - `v2/sft.sh`: `LOGGING_STRATEGY=epoch`
   - `v2/sft.sh`: `SAVE_STRATEGY=epoch`
   - `v2/sft.sh`: `SAVE_TOTAL_LIMIT=1`
-  - `v2/sft.sh`: `DISABLE_TQDM=true`
+  - `v2/sft.sh`: `DISABLE_TQDM=false`
   - `v2/sft.sh`: `REPORT_TO=none`
-  - `v2/sft.sh`: `QUIET_OUTPUT=1`
+  - `v2/sft.sh`: `QUIET_OUTPUT=0`
   - `v2/sft.sh`: use the active environment's `python -m torch.distributed.run`
 
-The default console output now keeps epoch-level averages, final runtime/checkpoint
-information, and errors. Set `QUIET_OUTPUT=0` only when full framework diagnostics
-are needed. These defaults are intended as a starting point for a 192 GB AMD GPU.
+The default console output shows a live training progress bar while keeping loss
+aggregation at epoch level. Evaluation also shows a live per-example progress bar.
+Set `DISABLE_TQDM=true` or `SHOW_PROGRESS=0` only for unattended runs. These
+defaults are intended as a starting point for a 192 GB AMD GPU.
 If the model is small and memory remains low, raise
 `PER_DEVICE_TRAIN_BATCH_SIZE`, `MAX_LENGTH`, or both.
 

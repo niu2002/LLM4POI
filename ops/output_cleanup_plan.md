@@ -11,11 +11,11 @@ Reduce noisy console output and prevent `outputs/` from growing with large, low-
    - default to epoch-level checkpoint saving
    - keep only the latest checkpoint by default
    - disable external logger backends by default
-   - show only epoch averages, final checkpoint/runtime, and errors
+   - show a live progress bar plus epoch averages and final checkpoint/runtime
    - launch through the active virtual environment's Python
 2. Update `v2/eval.py` and `v2/eval_hitk.py` to:
    - print summary metrics only by default
-   - hide progress bars by default
+   - show per-example progress bars by default
    - write detailed prediction JSONL only when explicitly enabled
 3. Add a cleanup script under `ops/` to remove historical large pure-log artifacts:
    - `logging.jsonl`

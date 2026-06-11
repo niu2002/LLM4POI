@@ -2,6 +2,29 @@
 
 This branch is for a Linux AMD remote server with large VRAM. It keeps the v2 path on `ms-swift` for training and `vLLM` for serving, instead of the Windows local smoke helpers used on `windows_base`.
 
+## Environment Baseline
+
+The AMD machine is a ModelScope / DSW ROCm image. Treat the image runtime as the source of truth. Do not rebuild the environment from `v2/environment.yml`, and do not casually reinstall `torch`, `torchaudio`, or `torchvision`, because that can break the ROCm stack that is already on the machine.
+
+From the environment snapshot you provided, the AMD box already has the core project stack around:
+
+- `agentscope==0.1.6`
+- `loguru==0.6.0`
+- `accelerate==1.12.0`
+- `datasets==3.6.0`
+- `fastapi==0.128.0`
+- `modelscope==1.37.1`
+- `ms-swift==3.11.3`
+- `openai==2.15.0`
+- `pandas==2.2.3`
+- `peft==0.18.1`
+- `pyarrow==22.0.0`
+- `transformers==4.55.4`
+- `trl==0.22.2`
+- `uvicorn==0.40.0`
+
+If the live machine differs from this snapshot, prefer the live machine. The goal on AMD is "add missing project packages only", not "force the local environment to match a static lock file".
+
 ## What Changed From `windows_base`
 
 - Removed Windows-only local smoke helpers from the AMD branch:
@@ -34,6 +57,38 @@ git fetch origin
 git checkout amd_remote
 git pull --ff-only
 ```
+
+## Install Project Dependencies Safely
+
+The old `ops/install_amd_deps.sh` idea came from an earlier project flow and is deprecated here. Do not rely on that old script name on the AMD server.
+
+After `git pull`, install only the project-level dependencies that are actually missing. Keep the existing ROCm / PyTorch stack in place:
+
+```bash
+pip install --upgrade-strategy only-if-needed \
+  agentscope==0.1.6 \
+  loguru==0.6.0 \
+  accelerate==1.12.0 \
+  datasets==3.6.0 \
+  fastapi==0.128.0 \
+  modelscope==1.37.1 \
+  ms-swift==3.11.3 \
+  openai==2.15.0 \
+  pandas==2.2.3 \
+  peft==0.18.1 \
+  pyarrow==22.0.0 \
+  transformers==4.55.4 \
+  trl==0.22.2 \
+  uvicorn==0.40.0
+```
+
+This environment repair should intentionally avoid reinstalling:
+
+- `torch`
+- `torchaudio`
+- `torchvision`
+
+If you later find that `vllm`, `deepspeed`, or another package needs a ROCm-specific build, install that one package deliberately after checking the current environment, instead of bulk reinstalling everything.
 
 ## No-GPU / Dry-Run Checks
 
@@ -115,6 +170,29 @@ MAX_NUM_BATCHED_TOKENS=196608
 ```
 
 ## Serving With vLLM
+
+On ROCm, `vLLM` startup is slow enough that it is easy to misdiagnose as a failure. The first launch of a model such as `Llama-3.1-8B-Instruct` may take more than 80 seconds because the server still needs to load weights, compile kernels, warm up, and capture graphs. A failed `curl` after `sleep 30` or `sleep 40` is not enough to conclude that serving failed.
+
+Example startup:
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --host 127.0.0.1 \
+  --port 7863 \
+  --model /mnt/workspace/comapoilatest/models/Llama-3.1-8B-Instruct \
+  --served-model-name llama3.1-8b \
+  --tensor-parallel-size 1 \
+  --dtype auto \
+  --gpu-memory-utilization 0.85
+```
+
+Recommended health check:
+
+```bash
+curl -m 5 -sS http://127.0.0.1:7863/v1/models
+```
+
+If the service is ready, the response should include `llama3.1-8b`.
 
 Full checkpoint:
 

@@ -6,6 +6,8 @@ MODEL_TYPE="${MODEL_TYPE:-}"
 DATASET_PATH="${DATASET_PATH:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 DRY_RUN="${DRY_RUN:-0}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+QUIET_OUTPUT="${QUIET_OUTPUT:-1}"
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 TRAIN_TYPE="${TRAIN_TYPE:-full}"
@@ -18,13 +20,17 @@ LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 MAX_LENGTH="${MAX_LENGTH:-32768}"
 SAVE_STEPS="${SAVE_STEPS:-5}"
 LOGGING_STEPS="${LOGGING_STEPS:-1}"
+SAVE_STRATEGY="${SAVE_STRATEGY:-epoch}"
+LOGGING_STRATEGY="${LOGGING_STRATEGY:-epoch}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
 DATASET_NUM_PROC="${DATASET_NUM_PROC:-8}"
-SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-2}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-1}"
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-zero3}"
 USE_LIGER_KERNEL="${USE_LIGER_KERNEL:-true}"
 ATTN_IMPL="${ATTN_IMPL:-flash_attn}"
+DISABLE_TQDM="${DISABLE_TQDM:-true}"
+REPORT_TO="${REPORT_TO:-none}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 if [[ -z "${MODEL_PATH}" || -z "${MODEL_TYPE}" || -z "${DATASET_PATH}" || -z "${OUTPUT_DIR}" ]]; then
@@ -51,7 +57,7 @@ EOF
 fi
 
 CMD=(
-torchrun --nproc_per_node="${NPROC_PER_NODE}" -m swift.cli.sft
+  "${PYTHON_BIN}" -m torch.distributed.run --nproc_per_node="${NPROC_PER_NODE}" -m swift.cli.sft
   --model "${MODEL_PATH}" \
   --model_type "${MODEL_TYPE}" \
   --train_type "${TRAIN_TYPE}" \
@@ -66,12 +72,16 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" -m swift.cli.sft
   --packing false \
   --save_steps "${SAVE_STEPS}" \
   --logging_steps "${LOGGING_STEPS}" \
+  --save_strategy "${SAVE_STRATEGY}" \
+  --logging_strategy "${LOGGING_STRATEGY}" \
   --max_length "${MAX_LENGTH}" \
   --warmup_ratio "${WARMUP_RATIO}" \
   --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
   --dataset_num_proc "${DATASET_NUM_PROC}" \
   --save_total_limit "${SAVE_TOTAL_LIMIT}" \
   --save_only_model true \
+  --disable_tqdm "${DISABLE_TQDM}" \
+  --report_to "${REPORT_TO}" \
   --output_dir "${OUTPUT_DIR}" \
   --deepspeed "${DEEPSPEED_CONFIG}" \
   --use_liger_kernel "${USE_LIGER_KERNEL}" \
@@ -84,12 +94,29 @@ if [[ -n "${EXTRA_ARGS}" ]]; then
   CMD+=("${EXTRA_ARGS_ARRAY[@]}")
 fi
 
-printf '[info] command:'
-printf ' %q' "${CMD[@]}"
-printf '\n'
+printf '[run] model=%s dataset=%s output=%s\n' "${MODEL_PATH}" "${DATASET_PATH}" "${OUTPUT_DIR}"
+printf '[run] epochs=%s batch=%s grad_acc=%s max_length=%s train_type=%s\n' \
+  "${NUM_TRAIN_EPOCHS}" "${PER_DEVICE_TRAIN_BATCH_SIZE}" \
+  "${GRADIENT_ACCUMULATION_STEPS}" "${MAX_LENGTH}" "${TRAIN_TYPE}"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
+  printf '[dry-run] command:'
+  printf ' %q' "${CMD[@]}"
+  printf '\n'
   exit 0
 fi
 
-"${CMD[@]}"
+if [[ "${QUIET_OUTPUT}" == "1" ]]; then
+  "${CMD[@]}" 2>&1 | awk '
+    /Traceback \(most recent call last\):/ { traceback=1 }
+    traceback { print; fflush(); next }
+    /(^|[^[:alpha:]])([Ee]rror|ERROR|Exception|FAILED|OOM|out of memory)([^[:alpha:]]|$)/ {
+      print; fflush(); next
+    }
+    /(^|[^[:alpha:]])(loss|eval_loss|train_loss|train_runtime|epoch|global_step|max_memory|last_model_checkpoint|best_model_checkpoint)([^[:alpha:]]|$)/ {
+      print; fflush()
+    }
+  '
+else
+  "${CMD[@]}"
+fi

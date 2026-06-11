@@ -174,8 +174,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--api-key", default="dummy")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional JSONL file to store detailed predictions.",
+    )
     parser.add_argument("--max-examples", type=int, default=None)
+    parser.add_argument("--show-progress", action="store_true")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
@@ -207,25 +213,31 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 return i, await evaluate_one(client, rec, args)
 
         tasks = [asyncio.create_task(guarded(i, rec)) for i, rec in enumerate(data)]
-        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Evaluating", unit="example"):
+        for fut in tqdm(
+            asyncio.as_completed(tasks),
+            total=len(tasks),
+            desc="Evaluating",
+            unit="example",
+            disable=not args.show_progress,
+        ):
             i, result = await fut
             out[i] = result
         return [item for item in out if item is not None]
 
     results = asyncio.run(run())
     total = len(results)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as f:
-        for item in results:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-
     print(f"Examples evaluated: {total}")
     for k in args.k_values:
         key = f"hit@{k}"
         hit = sum(int(item[key]) for item in results)
         score = hit / total if total else 0.0
         print(f"Hit@{k}: {score:.4f} ({hit}/{total})")
-    print(f"Detailed predictions written to {args.output}")
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with args.output.open("w", encoding="utf-8") as f:
+            for item in results:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        print(f"Detailed predictions written to {args.output}")
     return 0
 
 

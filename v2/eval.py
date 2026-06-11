@@ -8,8 +8,8 @@ JSONL file. The `--max-new-tokens` flag controls how many tokens the model may
 generate for each answer.
 
 
-The script prints aggregate accuracy and writes per-example details to the
-specified output file (or stdout if omitted).
+The script prints aggregate accuracy and only writes per-example details when
+an output file is explicitly provided.
 """
 
 from __future__ import annotations
@@ -176,8 +176,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--base-url", default="http://localhost:8000/v1", help="OpenAI-compatible base URL")
     parser.add_argument("--api-key", default="dummy", help="API key for the OpenAI-compatible server")
     parser.add_argument("--model", default="qwen2.5-nyc-sft", help="Model name exposed by the vLLM server")
-    parser.add_argument("--output", type=Path, default=None, help="Optional JSONL file to store predictions")
+    parser.add_argument("--output", type=Path, default=None, help="Optional JSONL file to store detailed predictions")
     parser.add_argument("--max-examples", type=int, default=None, help="Optional limit on number of examples")
+    parser.add_argument("--show-progress", action="store_true", help="Show the per-example progress bar")
     parser.add_argument(
         "--concurrency",
         type=int,
@@ -218,7 +219,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 return (i, await _evaluate_one(client, rec, args))
 
         tasks = [asyncio.create_task(_guarded(i, rec)) for i, rec in enumerate(data)]
-        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Evaluating", unit="example"):
+        for fut in tqdm(
+            asyncio.as_completed(tasks),
+            total=len(tasks),
+            desc="Evaluating",
+            unit="example",
+            disable=not args.show_progress,
+        ):
             i, r = await fut
             out[i] = r
         return [r for r in out if r is not None]

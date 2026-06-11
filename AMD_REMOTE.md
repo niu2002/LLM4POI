@@ -31,14 +31,25 @@ If the live machine differs from this snapshot, prefer the live machine. The goa
   - `v2/local_openai_server.py`
   - `v2/smoke_train_local.py`
 - Kept the script syntax fixes and environment-variable based launch style.
-- Raised remote defaults to use more memory:
+- Raised remote defaults to use more memory and reduced output noise:
   - `v2/sft.sh`: `MAX_LENGTH=32768`
   - `v2/serve_vllm.sh`: `MAX_MODEL_LEN=32768`
   - `v2/serve_vllm.sh`: `MAX_NUM_BATCHED_TOKENS=131072`
   - `v2/serve_vllm.sh`: `MAX_NUM_SEQS=128`
   - `v2/serve_vllm.sh`: `GPU_MEMORY_UTILIZATION=0.9`
+  - `v2/sft.sh`: `LOGGING_STRATEGY=epoch`
+  - `v2/sft.sh`: `SAVE_STRATEGY=epoch`
+  - `v2/sft.sh`: `SAVE_TOTAL_LIMIT=1`
+  - `v2/sft.sh`: `DISABLE_TQDM=true`
+  - `v2/sft.sh`: `REPORT_TO=none`
+  - `v2/sft.sh`: `QUIET_OUTPUT=1`
+  - `v2/sft.sh`: use the active environment's `python -m torch.distributed.run`
 
-These defaults are intended as a starting point for a 192 GB AMD GPU. If the model is small and memory remains low, raise `PER_DEVICE_TRAIN_BATCH_SIZE`, `MAX_LENGTH`, or both.
+The default console output now keeps epoch-level averages, final runtime/checkpoint
+information, and errors. Set `QUIET_OUTPUT=0` only when full framework diagnostics
+are needed. These defaults are intended as a starting point for a 192 GB AMD GPU.
+If the model is small and memory remains low, raise
+`PER_DEVICE_TRAIN_BATCH_SIZE`, `MAX_LENGTH`, or both.
 
 ## Pull This Branch On The AMD Server
 
@@ -230,11 +241,18 @@ bash serve_vllm.sh
 cd v2
 
 DATASET_PATH=../datasets/nyc/llm4poi_v2/nyc_gsm8k_test_llm4poi.parquet \
-OUTPUT_PATH=../outputs/nyc_amd_remote_predictions.jsonl \
 MODEL_NAME=llm4poi-lora \
 MAX_NEW_TOKENS=48 \
 CONCURRENCY=32 \
 TEMPERATURE=0.0 \
+bash eval.sh
+```
+
+If you really need per-sample prediction details, enable them explicitly:
+
+```bash
+WRITE_DETAILS=1 \
+OUTPUT_PATH=../outputs/nyc_amd_remote_predictions.jsonl \
 bash eval.sh
 ```
 
@@ -248,7 +266,6 @@ The default `v2/eval.py` reports single-sample exact match, which is equivalent 
 cd v2
 
 DATASET_PATH=../datasets/nyc/llm4poi_v2/nyc_gsm8k_test_llm4poi.parquet \
-OUTPUT_PATH=../outputs/nyc_hitk_predictions.jsonl \
 MODEL_NAME=llm4poi \
 BASE_URL=http://127.0.0.1:7864/v1 \
 MAX_NEW_TOKENS=48 \
@@ -258,6 +275,45 @@ TOP_P=0.95 \
 NUM_RETURN_SEQUENCES=20 \
 K_VALUES=1,5,10,20 \
 bash eval_hitk.sh
+```
+
+To save detailed sampled predictions:
+
+```bash
+WRITE_DETAILS=1 \
+OUTPUT_PATH=../outputs/nyc_hitk_predictions.jsonl \
+bash eval_hitk.sh
+```
+
+## Cleanup Historical Pure Logs
+
+Preview removable log-like files first:
+
+```bash
+bash ops/cleanup_large_outputs.sh ../outputs
+```
+
+Delete them after preview:
+
+```bash
+PREVIEW_ONLY=0 bash ops/cleanup_large_outputs.sh ../outputs
+```
+
+The cleanup script only removes logs and detailed evaluation JSONL files. It
+does not delete checkpoints. In the current 45 GB workspace, most disk usage is
+model weights rather than logs. After confirming that `checkpoint-64` is the
+required final model, the known historical checkpoints can be removed manually:
+
+```bash
+rm -rf \
+  /mnt/workspace/LLM4POI/outputs/nyc_sft_smoke_100 \
+  /mnt/workspace/LLM4POI/outputs/nyc_sft_500_full/v1-20260611-132726/checkpoint-50
+```
+
+This retains:
+
+```text
+/mnt/workspace/LLM4POI/outputs/nyc_sft_500_full/v1-20260611-132726/checkpoint-64
 ```
 
 This is a generative `Hit@K`: each request asks the model for multiple sampled answers and checks whether the gold POI id appears in the first `K` generations. It is useful for the v2 serving path, but it is not the same as a full candidate-pool logprob reranker.

@@ -161,8 +161,15 @@ async def _evaluate_one(
     pred_text = pred_text.split("<")[0]
     gold_text = gold_text.split("<")[0]
 
-    pred_cleaned = re.sub(r'\D', '', pred_text)
-    gold_cleaned = re.sub(r'\D', '', gold_text)
+    def extract_poi_id(value: str) -> str:
+        hex_match = re.search(r"\b[0-9a-fA-F]{24}\b", value)
+        if hex_match:
+            return hex_match.group(0).lower()
+        int_match = re.search(r"\b\d+\b", value)
+        return int_match.group(0) if int_match else value.strip().lower()
+
+    pred_cleaned = extract_poi_id(pred_text)
+    gold_cleaned = extract_poi_id(gold_text)
     is_correct = (pred_cleaned == gold_cleaned) and (pred_cleaned != "")
     return {
         "prompt": prompt_messages,

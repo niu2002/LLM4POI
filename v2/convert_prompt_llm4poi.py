@@ -158,8 +158,14 @@ def build_samples(
     dataset_split: str,
     history_limit: int,
 ) -> List[Dict[str, Any]]:
-    dataset_ranges = {"nyc": 4981, "tky": 7833, "ca": 9690}
-    range_val = dataset_ranges.get(dataset_name.lower(), 4981)
+    poi_ids = df["PoiId"].astype(str).str.strip()
+    if poi_ids.str.fullmatch(r"[0-9a-fA-F]{24}").all():
+        poi_hint = "POI id is a 24-character hexadecimal identifier."
+    elif poi_ids.str.fullmatch(r"\d+").all():
+        numeric_ids = poi_ids.astype(int)
+        poi_hint = f"POI id is an integer in the range from {numeric_ids.min()} to {numeric_ids.max()}."
+    else:
+        poi_hint = "Return the POI id exactly as it appears in the trajectory data."
 
     user_template = (
         "You will be given history and current trajectory data of a user from {dataset}.\n"
@@ -173,7 +179,8 @@ def build_samples(
         "as (time, poi_id, poi category):\n"
         "{current_section}"
         "</current>\n"
-        "Given the data, at {target_time}, which POI id will user {user_id} visit? Note that POI id is an integer in the range from 0 to {range_val}.\n"
+        "Given the data, at {target_time}, which POI id will user {user_id} visit? "
+        "{poi_hint} Return only the POI id without explanation.\n"
     )
 
     samples: List[Dict[str, Any]] = []
@@ -219,7 +226,7 @@ def build_samples(
             current_section=current_text,
             user_id=user_id,
             target_time=target_row["UTCTimeOffset"].strftime("%Y-%m-%d %H:%M:%S"),
-            range_val=range_val,
+            poi_hint=poi_hint,
         )
 
         target_poiid = str(target_row["PoiId"])

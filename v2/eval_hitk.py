@@ -25,7 +25,8 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit("openai package is required. Install via `pip install openai`.") from exc
 
 
-POI_ID_RE = re.compile(r"\b\d+\b")
+POI_HEX_RE = re.compile(r"\b[0-9a-fA-F]{24}\b")
+POI_INT_RE = re.compile(r"\b\d+\b")
 
 
 def load_messages(dataset_path: Path) -> List[dict]:
@@ -86,7 +87,7 @@ def normalize_answer(text: Any, extract_poi_id: bool = True) -> str:
         value = value.split("<", 1)[0].strip()
     value = value.splitlines()[0].strip() if value else value
     if extract_poi_id:
-        match = POI_ID_RE.search(value)
+        match = POI_HEX_RE.search(value) or POI_INT_RE.search(value)
         if match:
             return match.group(0).lower()
     return value.strip()

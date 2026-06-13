@@ -32,9 +32,10 @@ import argparse
 import ast
 import json
 from bisect import bisect_left
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Sequence, Set
 
 import pandas as pd
 import pyarrow as pa
@@ -108,6 +109,17 @@ class HistoryEntry:
     category: str
 
 
+@dataclass
+class TrajectoryContext:
+    trajectory_id: str
+    user_id: int
+    start_time: Any
+    end_time: Any
+    entries: List[Dict[str, Any]]
+    poi_ids: Set[str]
+    categories: Set[str]
+
+
 def build_history(train_df: pd.DataFrame) -> Dict[int, Dict[str, Any]]:
     """
     history_map[user_id] = {"entries": [HistoryEntry...], "datetimes": [datetime...]}
@@ -133,6 +145,101 @@ def build_history(train_df: pd.DataFrame) -> Dict[int, Dict[str, Any]]:
     return history
 
 
+def build_trajectory_contexts(train_df: pd.DataFrame) -> Dict[str, TrajectoryContext]:
+    contexts: Dict[str, TrajectoryContext] = {}
+    for trajectory_id, group in train_df.groupby("pseudo_session_trajectory_id"):
+        group = group.sort_values("UTCTimeOffset")
+        if group.empty:
+            continue
+        entries: List[Dict[str, Any]] = []
+        for _, row in group.iterrows():
+            dt = row["UTCTimeOffset"]
+            entries.append(
+                {
+                    "time_str": dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "poiid": str(row["PoiId"]),
+                    "category": row["category_name"],
+                }
+            )
+        contexts[str(trajectory_id)] = TrajectoryContext(
+            trajectory_id=str(trajectory_id),
+            user_id=int(group.iloc[0]["UserId"]),
+            start_time=group.iloc[0]["UTCTimeOffset"],
+            end_time=group.iloc[-1]["UTCTimeOffset"],
+            entries=entries,
+            poi_ids={str(v) for v in group["PoiId"].tolist()},
+            categories={str(v) for v in group["category_name"].tolist()},
+        )
+    return contexts
+
+
+def build_poi_trajectory_index(contexts: Dict[str, TrajectoryContext]) -> Dict[str, List[str]]:
+    index: Dict[str, List[str]] = defaultdict(list)
+    for trajectory_id, ctx in contexts.items():
+        for poi_id in ctx.poi_ids:
+            index[poi_id].append(trajectory_id)
+    return dict(index)
+
+
+def jaccard(left: Set[str], right: Set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    union = left | right
+    if not union:
+        return 0.0
+    return len(left & right) / len(union)
+
+
+def get_similar_trajectories(
+    trajectory_contexts: Dict[str, TrajectoryContext],
+    poi_index: Dict[str, List[str]],
+    query_entries: Sequence[Dict[str, Any]],
+    user_id: int,
+    cutoff_time: Any,
+    limit: int,
+) -> List[TrajectoryContext]:
+    if limit <= 0 or not query_entries:
+        return []
+
+    query_pois = {str(entry["poiid"]) for entry in query_entries}
+    query_categories = {str(entry["category"]) for entry in query_entries}
+
+    candidate_ids: Set[str] = set()
+    for poi_id in query_pois:
+        candidate_ids.update(poi_index.get(poi_id, []))
+    if len(candidate_ids) < limit * 3:
+        for trajectory_id, ctx in trajectory_contexts.items():
+            if ctx.categories & query_categories:
+                candidate_ids.add(trajectory_id)
+
+    scored = []
+    for trajectory_id in candidate_ids:
+        ctx = trajectory_contexts[trajectory_id]
+        if ctx.user_id == user_id or ctx.end_time >= cutoff_time:
+            continue
+        poi_score = jaccard(query_pois, ctx.poi_ids)
+        category_score = jaccard(query_categories, ctx.categories)
+        score = poi_score * 2.0 + category_score
+        if score <= 0:
+            continue
+        scored.append((score, ctx.end_time, ctx))
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [ctx for _, _, ctx in scored[:limit]]
+
+
+def format_similar_trajectories(trajectories: List[TrajectoryContext], entry_limit: int) -> str:
+    if not trajectories:
+        return "Other-User Similar Trajectories:\nNone.\n"
+
+    lines = ["Other-User Similar Trajectories:"]
+    for rank, ctx in enumerate(trajectories, start=1):
+        lines.append(f"[{rank}] user={ctx.user_id}, trajectory={ctx.trajectory_id}")
+        for entry in ctx.entries[-entry_limit:]:
+            lines.append(f"{entry['time_str']} | {entry['poiid']} | {entry['category']}")
+    return "\n".join(lines) + "\n"
+
+
 def get_history_entries(history_map: Dict[int, Dict[str, Any]], user_id: int, cutoff_time, limit: int) -> List[Dict[str, Any]]:
     user_history = history_map.get(int(user_id))
     if not user_history:
@@ -154,9 +261,14 @@ def format_entries(entries: List[Dict[str, Any]], header: str) -> str:
 def build_samples(
     df: pd.DataFrame,
     history_map: Dict[int, Dict[str, Any]],
+    trajectory_contexts: Dict[str, TrajectoryContext],
+    poi_index: Dict[str, List[str]],
     dataset_name: str,
     dataset_split: str,
     history_limit: int,
+    include_other_users: bool,
+    similar_trajectory_limit: int,
+    similar_entry_limit: int,
 ) -> List[Dict[str, Any]]:
     poi_ids = df["PoiId"].astype(str).str.strip()
     if poi_ids.str.fullmatch(r"[0-9a-fA-F]{24}").all():
@@ -173,6 +285,7 @@ def build_samples(
         "{history_section_header}\n"
         "{history_section}"
         "</history>\n"
+        "{other_users_block}"
         "<current>\n"
         "The following is the current trajectory of user {user_id}:\n"
         "The trajectories consist of check-in records and each check-in record is represented as a tuple "
@@ -218,11 +331,28 @@ def build_samples(
                 }
             )
         current_text = format_entries(current_entries, "the most recent entries (time, poi_id, poi category):")
+        other_users_block = ""
+        if include_other_users:
+            similar_trajectories = get_similar_trajectories(
+                trajectory_contexts=trajectory_contexts,
+                poi_index=poi_index,
+                query_entries=current_entries,
+                user_id=user_id,
+                cutoff_time=start_time,
+                limit=similar_trajectory_limit,
+            )
+            other_users_block = (
+                "<other_users>\n"
+                "The following trajectories come from other users before the current time and are similar to the current trajectory.\n"
+                f"{format_similar_trajectories(similar_trajectories, entry_limit=similar_entry_limit)}"
+                "</other_users>\n"
+            )
 
         user_prompt = user_template.format(
             dataset=dataset_name,
             history_section_header=history_header,
             history_section=history_text,
+            other_users_block=other_users_block,
             current_section=current_text,
             user_id=user_id,
             target_time=target_row["UTCTimeOffset"].strftime("%Y-%m-%d %H:%M:%S"),
@@ -239,6 +369,7 @@ def build_samples(
                 "trajectory_id": int(trajectory_id) if str(trajectory_id).isdigit() else trajectory_id,
                 "target_time": target_row["UTCTimeOffset"].strftime("%Y-%m-%d %H:%M:%S"),
                 "dataset_split": dataset_split,
+                "include_other_users": include_other_users,
             }
         )
 
@@ -265,6 +396,9 @@ def main() -> int:
     ap.add_argument("--test_csv", type=Path, required=True)
     ap.add_argument("--out_dir", type=Path, required=True)
     ap.add_argument("--history_limit", type=int, default=50, help="Max number of history entries per prompt (default: 50).")
+    ap.add_argument("--include_other_users", action="store_true", help="Add similar trajectories from other users to each prompt.")
+    ap.add_argument("--similar_trajectory_limit", type=int, default=20, help="Max other-user trajectories per prompt.")
+    ap.add_argument("--similar_entry_limit", type=int, default=5, help="Max entries shown for each similar trajectory.")
     ap.add_argument("--write_jsonl", action="store_true", help="Also write raw samples as jsonl for debugging.")
     args = ap.parse_args()
 
@@ -272,12 +406,32 @@ def main() -> int:
     test_df = prepare_dataframe(args.test_csv)
 
     history_map = build_history(train_df)
+    trajectory_contexts = build_trajectory_contexts(train_df)
+    poi_index = build_poi_trajectory_index(trajectory_contexts)
 
     train_samples = build_samples(
-        train_df, history_map, dataset_name=args.dataset, dataset_split="train", history_limit=args.history_limit
+        train_df,
+        history_map,
+        trajectory_contexts,
+        poi_index,
+        dataset_name=args.dataset,
+        dataset_split="train",
+        history_limit=args.history_limit,
+        include_other_users=args.include_other_users,
+        similar_trajectory_limit=args.similar_trajectory_limit,
+        similar_entry_limit=args.similar_entry_limit,
     )
     test_samples = build_samples(
-        test_df, history_map, dataset_name=args.dataset, dataset_split="test", history_limit=args.history_limit
+        test_df,
+        history_map,
+        trajectory_contexts,
+        poi_index,
+        dataset_name=args.dataset,
+        dataset_split="test",
+        history_limit=args.history_limit,
+        include_other_users=args.include_other_users,
+        similar_trajectory_limit=args.similar_trajectory_limit,
+        similar_entry_limit=args.similar_entry_limit,
     )
 
     def to_gsm(samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

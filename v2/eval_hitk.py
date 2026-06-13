@@ -114,6 +114,16 @@ async def evaluate_one(
 ) -> dict:
     prompt_messages, gold = prepare_prompt(record, args.system_prompt)
 
+    async def create_completion(prompt: str, max_tokens: int):
+        return await client.completions.create(
+            model=args.model,
+            prompt=prompt,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=max_tokens,
+            n=args.num_return_sequences,
+        )
+
     try:
         response = await client.chat.completions.create(
             model=args.model,
@@ -135,14 +145,12 @@ async def evaluate_one(
             for msg in prompt_messages
         )
         prompt = f"{prompt}\nassistant:"
-        response = await client.completions.create(
-            model=args.model,
-            prompt=prompt,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=args.max_new_tokens,
-            n=args.num_return_sequences,
-        )
+        try:
+            response = await create_completion(prompt, args.max_new_tokens)
+        except BadRequestError as exc:
+            if "maximum context length" not in str(exc):
+                raise
+            response = await create_completion(prompt, args.context_retry_max_tokens)
         predictions = [
             normalize_answer(choice.text, extract_poi_id=args.extract_poi_id)
             for choice in response.choices
@@ -187,6 +195,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--max-new-tokens", type=int, default=48)
+    parser.add_argument(
+        "--context-retry-max-tokens",
+        type=int,
+        default=16,
+        help="Retry with fewer output tokens when a long prompt exceeds context length.",
+    )
     parser.add_argument("--num-return-sequences", type=int, default=20)
     parser.add_argument("--k-values", default="1,5,10,20")
     parser.add_argument("--system_prompt", default="You are a helpful assistant.")

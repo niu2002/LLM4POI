@@ -2,18 +2,18 @@
 set -euo pipefail
 
 DATASET_PATH="${DATASET_PATH:-}"
+CANDIDATE_SOURCE="${CANDIDATE_SOURCE:-}"
 OUTPUT_PATH="${OUTPUT_PATH:-}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8100/v1}"
 API_KEY="${API_KEY:-dummy}"
 MODEL_NAME="${MODEL_NAME:-sft-full}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful assistant.}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-48}"
-CONTEXT_RETRY_MAX_TOKENS="${CONTEXT_RETRY_MAX_TOKENS:-16}"
+CANDIDATE_SIZE="${CANDIDATE_SIZE:-100}"
+SEED="${SEED:-42}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
 CONCURRENCY="${CONCURRENCY:-4}"
-TEMPERATURE="${TEMPERATURE:-0.7}"
-TOP_P="${TOP_P:-0.95}"
-NUM_RETURN_SEQUENCES="${NUM_RETURN_SEQUENCES:-20}"
-K_VALUES="${K_VALUES:-1,5,10,20}"
+TEMPERATURE="${TEMPERATURE:-0}"
+TOP_P="${TOP_P:-1}"
 MAX_EXAMPLES="${MAX_EXAMPLES:-}"
 WRITE_DETAILS="${WRITE_DETAILS:-0}"
 SHOW_PROGRESS="${SHOW_PROGRESS:-1}"
@@ -22,14 +22,13 @@ if [[ -z "${DATASET_PATH}" ]]; then
   cat <<'EOF'
 Usage:
   DATASET_PATH=/path/to/test.parquet \
+  CANDIDATE_SOURCE=/path/to/train_or_all.parquet \
   MODEL_NAME=my-served-model \
   BASE_URL=http://127.0.0.1:7864/v1 \
-  bash eval_hitk.sh
+  bash eval_candidate_acc.sh
 
-Optional overrides:
-  API_KEY, SYSTEM_PROMPT, MAX_NEW_TOKENS, CONCURRENCY,
-  TEMPERATURE, TOP_P, NUM_RETURN_SEQUENCES, K_VALUES, MAX_EXAMPLES,
-  WRITE_DETAILS=1 OUTPUT_PATH=/path/to/hitk_predictions.jsonl
+This runs candidate-constrained Acc@1. It is closer to ranking-style Acc@1 than
+free-form Hit@K, but it is not the original paper scorer.
 EOF
   exit 1
 fi
@@ -40,14 +39,17 @@ ARGS=(
   --model "${MODEL_NAME}"
   --dataset "${DATASET_PATH}"
   --system_prompt "${SYSTEM_PROMPT}"
+  --candidate-size "${CANDIDATE_SIZE}"
+  --seed "${SEED}"
   --max-new-tokens "${MAX_NEW_TOKENS}"
-  --context-retry-max-tokens "${CONTEXT_RETRY_MAX_TOKENS}"
   --concurrency "${CONCURRENCY}"
   --temperature "${TEMPERATURE}"
   --top-p "${TOP_P}"
-  --num-return-sequences "${NUM_RETURN_SEQUENCES}"
-  --k-values "${K_VALUES}"
 )
+
+if [[ -n "${CANDIDATE_SOURCE}" ]]; then
+  ARGS+=( --candidate-source "${CANDIDATE_SOURCE}" )
+fi
 
 if [[ -n "${MAX_EXAMPLES}" ]]; then
   ARGS+=( --max-examples "${MAX_EXAMPLES}" )
@@ -65,4 +67,4 @@ if [[ "${SHOW_PROGRESS}" == "1" ]]; then
   ARGS+=( --show-progress )
 fi
 
-python eval_hitk.py "${ARGS[@]}"
+python eval_candidate_acc.py "${ARGS[@]}"

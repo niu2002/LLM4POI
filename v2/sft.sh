@@ -16,7 +16,7 @@ TORCH_DTYPE="${TORCH_DTYPE:-bfloat16}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-3}"
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-16}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
-LEARNING_RATE="${LEARNING_RATE:-1e-5}"
+LEARNING_RATE="${LEARNING_RATE:-2e-5}"
 MAX_LENGTH="${MAX_LENGTH:-32768}"
 SAVE_STEPS="${SAVE_STEPS:-5}"
 LOGGING_STEPS="${LOGGING_STEPS:-1}"
@@ -49,7 +49,7 @@ Required environment variables:
   OUTPUT_DIR   Output checkpoint directory.
 
 High-memory defaults:
-  MAX_LENGTH defaults to 32768 for AMD remote runs.
+  LEARNING_RATE defaults to 2e-5 and MAX_LENGTH defaults to 32768, matching the paper-facing v1 recipe more closely.
   PER_DEVICE_TRAIN_BATCH_SIZE defaults to the original v2 value 16.
   Increase PER_DEVICE_TRAIN_BATCH_SIZE or MAX_LENGTH if memory remains unused.
 EOF

@@ -240,6 +240,36 @@ def format_similar_trajectories(trajectories: List[TrajectoryContext], entry_lim
     return "\n".join(lines) + "\n"
 
 
+def load_kqt_top_map(path: Path | None) -> Dict[str, List[str]]:
+    if path is None:
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"KQT top map must be a JSON object: {path}")
+    top_map: Dict[str, List[str]] = {}
+    for key, value in payload.items():
+        if isinstance(value, list):
+            top_map[str(key)] = [str(item) for item in value]
+    return top_map
+
+
+def get_kqt_trajectories(
+    trajectory_contexts: Dict[str, TrajectoryContext],
+    kqt_top_map: Dict[str, List[str]],
+    trajectory_id: str,
+    limit: int,
+) -> List[TrajectoryContext]:
+    if not kqt_top_map:
+        return []
+    trajectories: List[TrajectoryContext] = []
+    for similar_id in kqt_top_map.get(str(trajectory_id), [])[:limit]:
+        ctx = trajectory_contexts.get(str(similar_id))
+        if ctx is not None:
+            trajectories.append(ctx)
+    return trajectories
+
+
 def get_history_entries(history_map: Dict[int, Dict[str, Any]], user_id: int, cutoff_time, limit: int) -> List[Dict[str, Any]]:
     user_history = history_map.get(int(user_id))
     if not user_history:
@@ -269,6 +299,7 @@ def build_samples(
     include_other_users: bool,
     similar_trajectory_limit: int,
     similar_entry_limit: int,
+    kqt_top_map: Dict[str, List[str]],
 ) -> List[Dict[str, Any]]:
     poi_ids = df["PoiId"].astype(str).str.strip()
     if poi_ids.str.fullmatch(r"[0-9a-fA-F]{24}").all():
@@ -332,18 +363,27 @@ def build_samples(
             )
         current_text = format_entries(current_entries, "the most recent entries (time, poi_id, poi category):")
         other_users_block = ""
+        other_users_source = "none"
         if include_other_users:
-            similar_trajectories = get_similar_trajectories(
+            similar_trajectories = get_kqt_trajectories(
                 trajectory_contexts=trajectory_contexts,
-                poi_index=poi_index,
-                query_entries=current_entries,
-                user_id=user_id,
-                cutoff_time=start_time,
+                kqt_top_map=kqt_top_map,
+                trajectory_id=str(trajectory_id),
                 limit=similar_trajectory_limit,
             )
+            other_users_source = "kqt" if similar_trajectories else "jaccard"
+            if not similar_trajectories:
+                similar_trajectories = get_similar_trajectories(
+                    trajectory_contexts=trajectory_contexts,
+                    poi_index=poi_index,
+                    query_entries=current_entries,
+                    user_id=user_id,
+                    cutoff_time=start_time,
+                    limit=similar_trajectory_limit,
+                )
             other_users_block = (
                 "<other_users>\n"
-                "The following trajectories come from other users before the current time and are similar to the current trajectory.\n"
+                f"The following trajectories come from historical users before the current time and are similar to the current trajectory. Source: {other_users_source}.\n"
                 f"{format_similar_trajectories(similar_trajectories, entry_limit=similar_entry_limit)}"
                 "</other_users>\n"
             )
@@ -370,6 +410,7 @@ def build_samples(
                 "target_time": target_row["UTCTimeOffset"].strftime("%Y-%m-%d %H:%M:%S"),
                 "dataset_split": dataset_split,
                 "include_other_users": include_other_users,
+                "other_users_source": other_users_source,
             }
         )
 
@@ -399,6 +440,8 @@ def main() -> int:
     ap.add_argument("--include_other_users", action="store_true", help="Add similar trajectories from other users to each prompt.")
     ap.add_argument("--similar_trajectory_limit", type=int, default=20, help="Max other-user trajectories per prompt.")
     ap.add_argument("--similar_entry_limit", type=int, default=5, help="Max entries shown for each similar trajectory.")
+    ap.add_argument("--kqt_train_json", type=Path, default=None, help="Optional train_key_top200.json from traj_sim.py.")
+    ap.add_argument("--kqt_test_json", type=Path, default=None, help="Optional test_key_top200.json from traj_sim.py.")
     ap.add_argument("--write_jsonl", action="store_true", help="Also write raw samples as jsonl for debugging.")
     args = ap.parse_args()
 
@@ -408,6 +451,8 @@ def main() -> int:
     history_map = build_history(train_df)
     trajectory_contexts = build_trajectory_contexts(train_df)
     poi_index = build_poi_trajectory_index(trajectory_contexts)
+    kqt_train_top_map = load_kqt_top_map(args.kqt_train_json)
+    kqt_test_top_map = load_kqt_top_map(args.kqt_test_json)
 
     train_samples = build_samples(
         train_df,
@@ -420,6 +465,7 @@ def main() -> int:
         include_other_users=args.include_other_users,
         similar_trajectory_limit=args.similar_trajectory_limit,
         similar_entry_limit=args.similar_entry_limit,
+        kqt_top_map=kqt_train_top_map,
     )
     test_samples = build_samples(
         test_df,
@@ -432,6 +478,7 @@ def main() -> int:
         include_other_users=args.include_other_users,
         similar_trajectory_limit=args.similar_trajectory_limit,
         similar_entry_limit=args.similar_entry_limit,
+        kqt_top_map=kqt_test_top_map,
     )
 
     def to_gsm(samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

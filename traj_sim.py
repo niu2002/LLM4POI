@@ -1,382 +1,232 @@
-import io
-import os
-import copy
+import argparse
 import json
 import math
-import logging
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence
-import random
-import argparse
-import sys
 import pickle as pkl
-import heapq
+import random
+from pathlib import Path
 
+import numpy as np
 import torch
-import torch.nn as nn
-import transformers
-from torch.utils.data import Dataset
-from transformers import Trainer, DataCollatorForLanguageModeling, BitsAndBytesConfig
-from llama_attn_replace_sft import replace_llama_attn
-from gptneox_attn_replace import replace_gpt_neox_attn
-from peft import LoraConfig, get_peft_model
-from torch.distributed import barrier
 import torch.nn.functional as F
-import numpy as np
+import transformers
 from tqdm import tqdm
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 
+try:
+    from llama_attn_replace_sft import replace_llama_attn
+except Exception:  # pragma: no cover
+    replace_llama_attn = None
 
-IGNORE_INDEX = -100
-DEFAULT_PAD_TOKEN = "[PAD]"
-DEFAULT_EOS_TOKEN = "</s>"
-DEFAULT_BOS_TOKEN = "<s>"
-DEFAULT_UNK_TOKEN = "<unk>"
-
-
-@dataclass
-class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="EleutherAI/pythia-1.4b-deduped")
-    model_type: Optional[str] = field(default="llama")
-
-
-@dataclass
-class DataArguments:
-    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
-
-
-@dataclass
-class TrainingArguments(transformers.TrainingArguments):
-    cache_dir: Optional[str] = field(default=None)
-    optim: str = field(default="adamw_torch")
-    model_max_length: int = field(
-        default=8192 * 4,
-        metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
-    use_flash_attn: bool = field(
-        default=True,
-        metadata={"help": "Whether use flash attention for training."},
-    )
-    use_full_attn: bool = field(
-        default=False,
-        metadata={"help": "Whether to use plain, full-attention for training."},
-    )
-    low_rank_training: bool = field(
-        default=True,
-        metadata={"help": "Whether use low rank adaptation for training."},
-    )
-    trainable_params: str = field(
-        default="embed,norm",
-        metadata={"help": "Additional trainable parameters except LoRA weights, if low rank training."},
-    )
+try:
+    from gptneox_attn_replace import replace_gpt_neox_attn
+except Exception:  # pragma: no cover
+    replace_gpt_neox_attn = None
 
 
 def parse_config():
-    parser = argparse.ArgumentParser(description='arg parser')
-    parser.add_argument('--batch_size', type=int, default=32, help='batch size during inference')
-    parser.add_argument('--base_model', type=str, default="/data1/pretrained-models/llama-7b-hf")
-    parser.add_argument('--cache_dir', type=str, default="./cache")
-    parser.add_argument('--seq_len', type=int, default=32768, help='context length during evaluation')
-    parser.add_argument('--context_size', type=int, default=32768, help='context size during fine-tuning')
-    parser.add_argument('--peft_model', type=str, default=None, help='')
-    parser.add_argument('--flash_attn', type=bool, default=True, help='')
-    parser.add_argument('--data_path', type=str, default="./test.bin", help='')
-    parser.add_argument('--output_dir', type=str, default="/g/data/hn98/peibo/next-poi/outputmodels/finetune-31/",
-                        help='')
-    parser.add_argument('--dataset_name', type=str, default="nyc",
-                        help='')
-    args = parser.parse_args()
-    return args
+    parser = argparse.ArgumentParser(description="Compute KQT-style trajectory similarity.")
+    parser.add_argument("--dataset_name", type=str, default="nyc", choices=["nyc", "tky", "ca"])
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--data_path", type=str, default=None, help="Directory containing train/test_kq_pairs.json.")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--seq_len", type=int, default=1024)
+    parser.add_argument("--context_size", type=int, default=32768)
+    parser.add_argument("--top_k", type=int, default=200)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--torch_dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "attention"])
+    parser.add_argument("--exclude_same_user", action="store_true")
+    parser.add_argument("--save_embeddings", action="store_true")
+    return parser.parse_args()
 
 
-def smart_tokenizer_and_embedding_resize(
-        special_tokens_dict: Dict,
-        tokenizer: transformers.PreTrainedTokenizer,
-        model: transformers.PreTrainedModel,
-):
-    """Resize tokenizer and embedding.
-
-    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
-    """
-    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
-    model.resize_token_embeddings(len(tokenizer))
-
-    if num_new_tokens > 0:
-        input_embeddings = model.get_input_embeddings().weight.data
-        output_embeddings = model.get_output_embeddings().weight.data
-
-        input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-
-        input_embeddings[-num_new_tokens:] = input_embeddings_avg
-        output_embeddings[-num_new_tokens:] = output_embeddings_avg
+def jload(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def _make_r_io_base(f, mode: str):
-    if not isinstance(f, io.IOBase):
-        f = open(f, mode=mode)
-    return f
+def dump_json(path, payload):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    print(f"[info] wrote: {path}")
 
 
-def jload(f, mode="r"):
-    """Load a .json file into a dictionary."""
-    f = _make_r_io_base(f, mode)
-    jdict = json.load(f)
-    f.close()
-    return jdict
+def compute_features(hidden, attention=None, attention_mask=None, pooling="mean"):
+    # Original traj_sim used an attention-weighted hidden-state feature. Keep it
+    # available, but default to masked mean because attention output is very
+    # memory-heavy on long contexts.
+    if pooling == "attention" and attention is not None:
+        averaged_attention = attention.mean(dim=1)
+        weighted_hidden_states = torch.zeros_like(hidden)
+        batch_size, sequence_length, _ = hidden.shape
+        for i in range(batch_size):
+            for j in range(sequence_length):
+                weighted_hidden_states[i, j, :] = torch.matmul(averaged_attention[i, j, :], hidden[i, :, :])
+        pooled = weighted_hidden_states.mean(dim=(0, 1), keepdim=True)
+        return F.normalize(pooled.float(), p=2, dim=-1).squeeze(0)
+
+    if attention_mask is None:
+        pooled = hidden.mean(dim=1)
+    else:
+        mask = attention_mask.unsqueeze(-1)
+        pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+    return F.normalize(pooled.float(), p=2, dim=-1)
 
 
-def get_as_batch(data, seq_length, batch_size, device='cpu', sliding_window=256):
-    all_ix = list(range(0, len(data) - seq_length, sliding_window))
-    all_ix.pop()
-
-    for idx in range(0, len(all_ix), batch_size):
-        ix = all_ix[idx:idx + batch_size]
-        assert all([idx + seq_length + 1 <= len(data) for idx in ix])
-        x = torch.stack([torch.from_numpy((data[i:i + seq_length]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((data[i + 1:i + 1 + seq_length]).astype(np.int64)) for i in ix])
-        if device != 'cpu':
-            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-        yield x, y
+def dtype_from_name(name):
+    if name == "bfloat16":
+        return torch.bfloat16
+    if name == "float16":
+        return torch.float16
+    return torch.float32
 
 
-def iceildiv(x, y):
-    return (x + y - 1) // y
+def load_model_and_tokenizer(args):
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        args.model_path,
+        model_max_length=args.context_size,
+        padding_side="right",
+        use_fast=True,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    config = transformers.AutoConfig.from_pretrained(
+        args.model_path,
+        output_hidden_states=True,
+        output_attentions=args.pooling == "attention",
+        trust_remote_code=True,
+    )
+    orig_ctx_len = getattr(config, "max_position_embeddings", None)
+    if orig_ctx_len and args.context_size > orig_ctx_len:
+        scaling_factor = float(math.ceil(args.context_size / orig_ctx_len))
+        config.rope_scaling = {"type": "linear", "factor": scaling_factor}
+
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        config=config,
+        torch_dtype=dtype_from_name(args.torch_dtype),
+        trust_remote_code=True,
+    ).to(args.device)
+    model.eval()
+    return model, tokenizer
 
 
-def compute_features(hidden, attention):
-    averaged_attention = attention.mean(dim=1)
-    weighted_hidden_states = torch.zeros_like(hidden)
-    batch_size, sequence_length, hidden_size = hidden.shape
-    for i in range(batch_size):
-        # For each example, perform a weighted sum of hidden states
-        # based on the attention weights
-        for j in range(sequence_length):
-            weighted_hidden_states[i, j, :] = torch.matmul(
-                averaged_attention[i, j, :],
-                hidden[i, :, :]
+def encode_texts(model, tokenizer, texts, args):
+    if args.pooling == "attention" and args.batch_size != 1:
+        raise ValueError("--pooling attention requires --batch_size 1 to preserve one feature per trajectory.")
+    features = []
+    for start in tqdm(range(0, len(texts), args.batch_size), desc="Encoding K/Q text", unit="batch"):
+        batch_texts = texts[start : start + args.batch_size]
+        batch = tokenizer(
+            batch_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=args.seq_len,
+        ).to(args.device)
+        with torch.no_grad():
+            output = model(
+                **batch,
+                output_hidden_states=True,
+                output_attentions=args.pooling == "attention",
             )
-    weighted_hidden_states = weighted_hidden_states.mean(axis=[0, 1])
-    return weighted_hidden_states
+            last_attention = output.attentions[-1] if args.pooling == "attention" else None
+            pooled = compute_features(
+                output.hidden_states[-1],
+                attention=last_attention,
+                attention_mask=batch["attention_mask"],
+                pooling=args.pooling,
+            )
+            features.append(pooled.detach().cpu())
+        del batch, output
+        torch.cuda.empty_cache()
+    return torch.cat(features, dim=0)
+
+
+def load_kq(path):
+    rows = jload(path)
+    rows = [row for row in rows if row.get("key") and row.get("query")]
+    return rows
+
+
+def build_feature_payload(rows, key_embeddings, query_embeddings):
+    payload = {}
+    for idx, row in enumerate(rows):
+        payload[str(row["traj_id"])] = {
+            "key": key_embeddings[idx],
+            "query": query_embeddings[idx],
+            "start_time": float(row["start_time"]),
+            "end_time": float(row["end_time"]),
+            "user_id": int(str(row.get("user_id", -1))) if str(row.get("user_id", "-1")).isdigit() else -1,
+        }
+    return payload
+
+
+def compute_similarity(target_rows, train_rows, target_key_embeddings, train_query_embeddings, args):
+    train_start = torch.tensor([float(row["start_time"]) for row in train_rows])
+    train_end = torch.tensor([float(row["end_time"]) for row in train_rows])
+    train_user = torch.tensor([int(row.get("user_id", -1)) for row in train_rows])
+    target_start = torch.tensor([float(row["start_time"]) for row in target_rows])
+    target_user = torch.tensor([int(row.get("user_id", -1)) for row in target_rows])
+    train_ids = [str(row["traj_id"]) for row in train_rows]
+    results = {}
+
+    train_query_embeddings = train_query_embeddings.to(args.device)
+    for idx in tqdm(range(len(target_rows)), desc="Computing trajectory topK", unit="traj"):
+        key = target_key_embeddings[idx : idx + 1].to(args.device)
+        scores = (key @ train_query_embeddings.T).squeeze(0).detach().cpu()
+        valid = train_end < target_start[idx]
+        if args.exclude_same_user:
+            valid = valid & (train_user != target_user[idx])
+        scores[~valid] = -float("inf")
+        k = min(args.top_k, int(valid.sum().item()))
+        if k <= 0:
+            results[str(target_rows[idx]["traj_id"])] = []
+            continue
+        values, indices = torch.topk(scores, k=k)
+        selected = []
+        for value, train_idx in zip(values.tolist(), indices.tolist()):
+            if math.isfinite(value):
+                selected.append(train_ids[train_idx])
+        results[str(target_rows[idx]["traj_id"])] = selected
+    return results
 
 
 def main(args):
-    device = "cuda:0"
     seed = 2
-    torch.cuda.set_device(device)
-
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
 
-    model_path = '/g/data/hn98/models/llama2/llama-2-7b-longlora-32k-ft/'
-    output_dir = args.output_dir
-    print("data path", args.data_path)
-    print("base model", model_path)
-    print("peft model", output_dir)
+    data_path = Path(args.data_path) if args.data_path else Path("datasets") / "processed" / args.dataset_name
+    train_kq_path = data_path / "train_kq_pairs.json"
+    test_kq_path = data_path / "test_kq_pairs.json"
+    print(f"[info] data_path={data_path}")
+    print(f"[info] model_path={args.model_path}")
+    print(f"[info] pooling={args.pooling} top_k={args.top_k}")
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_path,
-        model_max_length=32768,
-        padding_side="right",
-        use_fast=True,
-    )
+    train_rows = load_kq(train_kq_path)
+    test_rows = load_kq(test_kq_path)
+    print(f"[info] train K/Q rows={len(train_rows)}")
+    print(f"[info] test K/Q rows={len(test_rows)}")
 
-    # print(tokenizer('6', return_tensors="pt").to(device))
-    # print(tokenizer.decode([    29946]))
-    # sys.exit()
-    # if args.flash_attn:
-    #     replace_llama_attn(inference=True)
+    model, tokenizer = load_model_and_tokenizer(args)
+    train_key = encode_texts(model, tokenizer, [row["key"] for row in train_rows], args)
+    train_query = encode_texts(model, tokenizer, [row["query"] for row in train_rows], args)
+    test_key = encode_texts(model, tokenizer, [row["key"] for row in test_rows], args)
 
-    # Set RoPE scaling factor
-    config = transformers.AutoConfig.from_pretrained(
-        model_path,
-        cache_dir=None,
-        output_hidden_states=True,
-        output_attentions=True,
-        _flash_attn_2_enabled=True
-    )
+    if args.save_embeddings:
+        with (data_path / "train_kqt.pkl").open("wb") as fp:
+            pkl.dump(build_feature_payload(train_rows, train_key, train_query), fp)
+        with (data_path / "test_kqt.pkl").open("wb") as fp:
+            pkl.dump(build_feature_payload(test_rows, test_key, test_key), fp)
 
-    context_size = args.context_size if args.context_size > 0 else args.seq_len
-    orig_ctx_len = getattr(config, "max_position_embeddings", None)  # this value should be 4096 for LLaMA2 models
-    if orig_ctx_len and context_size > orig_ctx_len:
-        scaling_factor = float(math.ceil(context_size / orig_ctx_len))
-        config.rope_scaling = {"type": "linear", "factor": scaling_factor}
+    train_results = compute_similarity(train_rows, train_rows, train_key, train_query, args)
+    test_results = compute_similarity(test_rows, train_rows, test_key, train_query, args)
+    dump_json(data_path / "train_key_top200.json", train_results)
+    dump_json(data_path / "test_key_top200.json", test_results)
 
-    # Load model and tokenizer
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_path,
-        device_map='auto',
-        config=config,
-        cache_dir=None,
-        torch_dtype=torch.bfloat16,
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=False,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        ),
-    )
-    model.resize_token_embeddings(32001)
-
-    special_tokens_dict = dict()
-    if tokenizer.pad_token is None:
-        special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
-    if tokenizer.eos_token is None:
-        special_tokens_dict["eos_token"] = DEFAULT_EOS_TOKEN
-    if tokenizer.bos_token is None:
-        special_tokens_dict["bos_token"] = DEFAULT_BOS_TOKEN
-    if tokenizer.unk_token is None:
-        special_tokens_dict["unk_token"] = DEFAULT_UNK_TOKEN
-
-    smart_tokenizer_and_embedding_resize(
-        special_tokens_dict=special_tokens_dict,
-        tokenizer=tokenizer,
-        model=model,
-    )
-
-    targets = ["q_proj", "k_proj", "v_proj", "o_proj"]
-
-    config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        target_modules=targets,
-        lora_dropout=0,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, config)
-    model.eval()
-
-    data_path = f'datasets/processed/{args.dataset_name}/'
-
-    def compute_fea(train=True):
-        key_query_traj = {}
-        if train:
-            output = 'train'
-        else:
-            output = 'test'
-        if train:
-            list_data_dict = jload(data_path + f'{output}_kq_pairs.json')
-        else:
-            list_data_dict = jload(data_path + f'{output}_kq_pairs.json')
-        for e in tqdm(list_data_dict, desc="Processing lines", total=len(list_data_dict)):
-            try:
-                key = tokenizer(e['key'], return_tensors="pt").to(device)
-                key = model(**key)
-                key = compute_features(key.hidden_states[-1], key.attentions[-1]).cpu().detach()
-                torch.cuda.empty_cache()
-                query = tokenizer(e['query'], return_tensors="pt").to('cuda:1')
-                query = model(**query)
-                query = compute_features(query.hidden_states[-1], query.attentions[-1]).cpu().detach()
-                torch.cuda.empty_cache()
-                key_query_traj[e['traj_id']] = {'key': key, 'query': query, 'start_time': e['start_time'], 'end_time':e['end_time']}
-            except Exception as ex:
-                print(f"An error occurred: {ex}")  # Log the exception
-                continue
-
-        with open(data_path + f'{output}_kqt.pkl', 'wb') as fp:
-            pkl.dump(key_query_traj, fp)
-
-    compute_fea(True)
-    compute_fea(False)
-
-    def compute_sim(train=True):
-        if train:
-            with open(data_path + 'train_kqt.pkl', 'rb') as fp:
-                key_query_traj_train = pkl.load(fp)
-            with open(data_path + 'train_kqt.pkl', 'rb') as fp:
-                key_query_traj = pkl.load(fp)
-        else:
-            with open(data_path + 'train_kqt.pkl', 'rb') as fp:
-                key_query_traj_train = pkl.load(fp)
-            with open(data_path + 'test_kqt.pkl', 'rb') as fp:
-                key_query_traj = pkl.load(fp)
-        # Assuming key_query_traj is already populated with PyTorch tensors
-        results = {}
-        gpus = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
-
-        # Function to compute similarity for a subset of data on a specific GPU
-        def compute_similarity_on_gpu(subset, other_subset, gpu):
-            local_results = {}
-
-            # Stack all query tensors for batch processing
-            query_tensors = [other_element['query'].to(gpu).reshape(1, -1) for other_element in other_subset.values()]
-            stacked_queries = torch.vstack(query_tensors)
-
-            # Convert start_times and end_times from strings to floats
-            start_times = torch.tensor([float(element['start_time']) for element in subset.values()], device=gpu)
-            end_times = torch.tensor([float(other_element['end_time']) for other_element in other_subset.values()],
-                                     device=gpu)
-
-            # Pre-compute a matrix for time condition checks
-            time_condition_matrix = start_times[:, None] > end_times
-
-            for traj_id, element in tqdm(subset.items(), desc="Computing Similarities"):
-                key_tensor = element['key'].to(gpu).reshape(1, -1)
-
-                # Filter queries based on time condition
-                valid_indices = time_condition_matrix[list(subset.keys()).index(traj_id)]
-                filtered_queries = stacked_queries[valid_indices]
-
-                if len(filtered_queries) == 0:
-                    continue
-                # Also filter the trajectory IDs
-                filtered_traj_ids = [traj_id for traj_id, valid in zip(list(other_subset.keys()), valid_indices.cpu().numpy()) if valid]
-        
-                # Compute similarities only for the filtered queries
-                batch_similarities = F.cosine_similarity(key_tensor, filtered_queries)
-
-                # Extract top 35 similarities
-                top_k = min(len(filtered_queries), 35)
-
-                # Extract top similarities
-                if top_k > 0:
-                    _, top_indices = torch.topk(batch_similarities, k=top_k)
-                    top_queries_traj_ids = [filtered_traj_ids[idx] for idx in top_indices.cpu().numpy()]
-                    local_results[traj_id] = top_queries_traj_ids
-                else:
-                    local_results[traj_id] = []
-            return local_results
-        # Divide the data among GPUs
-        data_subsets = {gpu: {} for gpu in gpus}
-        for i, (traj_id, data) in enumerate(key_query_traj.items()):
-            gpu = gpus[i % len(gpus)]
-            data_subsets[gpu][traj_id] = data
-
-        # Initialize a global progress bar
-        total_tasks = len(key_query_traj)
-        progress_bar = tqdm(total=total_tasks, desc="Overall Progress")
-
-        # Compute similarities in parallel on multiple GPUs
-        with ThreadPoolExecutor(max_workers=len(gpus)) as executor:
-            futures = []
-            for gpu in gpus:
-                future = executor.submit(compute_similarity_on_gpu, data_subsets[gpu], key_query_traj_train, gpu)
-                futures.append(future)
-                # Update the progress bar immediately after task submission
-                progress_bar.update(1)
-
-            # Retrieve results from completed futures
-            for future in futures:
-                local_results = future.result()
-                results.update(local_results)
-
-        progress_bar.close()
-        if train:
-            with open(data_path + 'train_key_top200.json', 'w') as fp:
-                json.dump(results, fp)
-        else:
-            with open(data_path + 'test_key_top200.json', 'w') as fp:
-                json.dump(results, fp)
-    compute_sim(True)
-    compute_sim(False)
 
 if __name__ == "__main__":
-    args = parse_config()
-    main(args)
+    main(parse_config())

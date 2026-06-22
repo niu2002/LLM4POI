@@ -1,115 +1,137 @@
-import sys
-
-import pandas as pd
-import json
 import argparse
+import json
+import re
+from pathlib import Path
 
 import pandas as pd
-import json
 from tqdm import tqdm
 
-def generate_kq_pairs(main_data):
-    # Sort the dataframe by UserId, pseudo_session_trajectory_id, and timestamp
-    main_data = main_data.sort_values(by=['UserId', 'pseudo_session_trajectory_id', 'UTCTimeOffsetEpoch'])
 
-    # List to store the QA pairs
+def simplify_poi_category(text):
+    return re.sub(r"\[\{'url': '[^']+', 'name': '([^']+)'}\]", r"\1", str(text))
+
+
+def prepare_dataframe(path):
+    data = pd.read_csv(path)
+    required = ["UserId", "pseudo_session_trajectory_id", "UTCTimeOffset", "PoiId", "PoiCategoryName"]
+    for col in required:
+        if col not in data.columns:
+            raise ValueError(f"Missing required column {col!r} in {path}")
+    data["UTCTimeOffset"] = pd.to_datetime(data["UTCTimeOffset"])
+    if "UTCTimeOffsetEpoch" not in data.columns:
+        data["UTCTimeOffsetEpoch"] = data["UTCTimeOffset"].astype("int64") // 1_000_000_000
+    data["PoiCategoryName"] = data["PoiCategoryName"].apply(simplify_poi_category)
+    if "PoiCategoryId" not in data.columns:
+        data["PoiCategoryId"] = pd.factorize(data["PoiCategoryName"].astype(str))[0]
+    return data
+
+
+def row_to_sentence(row, user):
+    return (
+        f"At {row['UTCTimeOffset']}, user {user} visited POI id {row['PoiId']} "
+        f"which is a {row['PoiCategoryName']} and has Category id {row['PoiCategoryId']}."
+    )
+
+
+def generate_kq_pairs(main_data, history_tail=5):
+    # This follows the original paper code structure: query is the full trajectory,
+    # key is the prefix of the current trajectory, or recent same-user history for
+    # single-check-in trajectories.
+    main_data = main_data.sort_values(by=["UserId", "pseudo_session_trajectory_id", "UTCTimeOffsetEpoch"])
     key_query_pairs = []
 
-    # Iterate over each user
-    for user in tqdm(main_data['UserId'].unique()):
-        user_data = main_data[main_data['UserId'] == user]
+    for user in tqdm(main_data["UserId"].unique(), desc="Generating K/Q pairs", unit="user"):
+        user_data = main_data[main_data["UserId"] == user].sort_values("UTCTimeOffsetEpoch")
+        for traj_id in user_data["pseudo_session_trajectory_id"].unique():
+            user_trajectory_data = user_data[user_data["pseudo_session_trajectory_id"] == traj_id]
+            start_time = user_trajectory_data["UTCTimeOffsetEpoch"].min()
+            end_time = user_trajectory_data["UTCTimeOffsetEpoch"].max()
 
-        # Iterate over each unique trajectory for the user based on 'pseudo_session_trajectory_id'
-        for traj_id in user_data['pseudo_session_trajectory_id'].unique():
-            user_trajectory_data = user_data[user_data['pseudo_session_trajectory_id'] == traj_id]
-            start_time_of_current_traj = user_trajectory_data['UTCTimeOffsetEpoch'].min()
-            end_time_of_current_traj = user_trajectory_data['UTCTimeOffsetEpoch'].max()
-
-            # Create the query using the last entry in the trajectory
             query = [f"The following data is a trajectory of user {user}:"]
             for _, row in user_trajectory_data.iterrows():
-                query.append(
-                    f"At {row['UTCTimeOffset']}, user {user} visited POI id {row['PoiId']} which is a {row['PoiCategoryName']} and has Category id {row['PoiCategoryId']}.")
-
+                query.append(row_to_sentence(row, user))
             query = " ".join(query)
 
-            # Check if current trajectory has only one entry
             if len(user_trajectory_data) == 1:
-                # Get previous trajectories of the same user up to 5 entries
-                prev_trajectories = user_data[user_data['UTCTimeOffsetEpoch'] < start_time_of_current_traj]
-                if not prev_trajectories.empty:
-                    prev_entries = prev_trajectories.tail(5)  # Get up to 5 latest entries from previous trajectories
-                    key = [f"The following data is a trajectory of user {user}:"]
-                    for _, row in prev_entries.iterrows():
-                        key.append(
-                            f"At {row['UTCTimeOffset']}, user {user} visited POI id {row['PoiId']} which is a {row['PoiCategoryName']} and has Category id {row['PoiCategoryId']}.")
-
-                    key = " ".join(key)
-                # Only continue if there are entries in the trajectory
-                else:
+                prev_trajectories = user_data[user_data["UTCTimeOffsetEpoch"] < start_time]
+                if prev_trajectories.empty:
                     continue
+                key_rows = prev_trajectories.tail(history_tail)
             else:
-                # Create the key based on the current trajectory
-                key = [f"The following data is a trajectory of user {user}:"]
-                for _, row in user_trajectory_data[:-1].iterrows():
-                    key.append(
-                        f"At {row['UTCTimeOffset']}, user {user} visited POI id {row['PoiId']} which is a {row['PoiCategoryName']} and has Category id {row['PoiCategoryId']}.")
+                key_rows = user_trajectory_data.iloc[:-1]
 
-                key = " ".join(key)
+            key = [f"The following data is a trajectory of user {user}:"]
+            for _, row in key_rows.iterrows():
+                key.append(row_to_sentence(row, user))
+            key = " ".join(key)
 
-
-
-            # Append the question-answer pair to the list
-            key_query_pairs.append((key, query, str(traj_id), str(start_time_of_current_traj), str(end_time_of_current_traj)))
+            key_query_pairs.append((key, query, str(traj_id), str(start_time), str(end_time)))
 
     return key_query_pairs
 
-import re
-def simplify_poi_category(text):
-    # Modify this regular expression pattern based on the specific substitution you need
-    return re.sub(r"\[\{'url': '[^']+', 'name': '([^']+)'}\]", r'\1', text)
+
+def resolve_paths(args):
+    if args.data_dir:
+        data_dir = Path(args.data_dir)
+    else:
+        data_dir = Path("..") / "datasets" / args.dataset_name / "preprocessed"
+    train_csv = Path(args.train_csv) if args.train_csv else data_dir / "train_sample.csv"
+    test_csv = Path(args.test_csv) if args.test_csv else data_dir / "test_sample_with_traj.csv"
+    out_dir = Path(args.out_dir) if args.out_dir else data_dir
+    return train_csv, test_csv, out_dir
+
 
 def main():
-    # Create the argument parser
-    parser = argparse.ArgumentParser(description="Process dataset names.")
-
-    # Add an argument for the dataset name
-    parser.add_argument("-dataset_name", type=str, choices=['ca', 'nyc', 'tky'],
-                        help="Name of the dataset (e.g., ca, nyc, tky)")
-
-    # Parse the arguments
+    parser = argparse.ArgumentParser(description="Generate original LLM4POI K/Q trajectory pairs.")
+    parser.add_argument("-dataset_name", "--dataset_name", type=str, choices=["ca", "nyc", "tky"], required=True)
+    parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--train_csv", type=str, default=None)
+    parser.add_argument("--test_csv", type=str, default=None)
+    parser.add_argument("--out_dir", type=str, default=None)
+    parser.add_argument("--history_tail", type=int, default=5)
     args = parser.parse_args()
 
-    # Your processing code here
-    print(f"Processing dataset: {args.dataset_name}")
-    path = f'../datasets/{args.dataset_name}/preprocessed/'
-    # Read the data
-    train_data = pd.read_csv(f'{path}train_sample.csv')
-    test_data = pd.read_csv(f'{path}test_sample_with_traj.csv')
-    train_data['PoiCategoryName'] = train_data['PoiCategoryName'].apply(simplify_poi_category)
+    train_csv, test_csv, out_dir = resolve_paths(args)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[info] train_csv={train_csv}")
+    print(f"[info] test_csv={test_csv}")
+    print(f"[info] out_dir={out_dir}")
 
-    # Save the modified DataFrame to a new CSV file
-    train_data.to_csv(f'{path}train_sample.csv', index=False)
-    test_data['PoiCategoryName'] = test_data['PoiCategoryName'].apply(simplify_poi_category)
+    train_data = prepare_dataframe(train_csv)
+    test_data = prepare_dataframe(test_csv)
 
-    # Save the modified DataFrame to a new CSV file
-    test_data.to_csv(f'{path}test_sample.csv', index=False)
-    # Generate the QA pairs
-    kq_pairs_train = generate_kq_pairs(train_data)
-    kq_pairs_test = generate_kq_pairs(test_data)
+    kq_pairs_train = generate_kq_pairs(train_data, history_tail=args.history_tail)
+    qa_dict_train = [
+        {
+            "key": key,
+            "query": query,
+            "traj_id": traj_id,
+            "user_id": int(str(traj_id).split("_", 1)[0]) if str(traj_id).split("_", 1)[0].isdigit() else None,
+            "start_time": start,
+            "end_time": end,
+        }
+        for key, query, traj_id, start, end in kq_pairs_train
+    ]
+    with (out_dir / "train_kq_pairs.json").open("w", encoding="utf-8") as json_file:
+        json.dump(qa_dict_train, json_file, ensure_ascii=False)
+    print(f"[info] wrote {len(qa_dict_train)} train K/Q pairs")
 
-    # Save the train QA pairs in JSON format
-    qa_dict_train = [{"key": q, "query": a, "traj_id": t, 'start_time':s, 'end_time':e} for q, a, t, s, e in kq_pairs_train]
-    print(len(qa_dict_train))
-    with open(f'{path}train_kq_pairs.json', 'w') as json_file:
-        json.dump(qa_dict_train, json_file)
-
-    qa_dict_test = [{"key": q, "query": a, "traj_id": t, 'start_time':s, 'end_time':e} for q, a, t, s, e in kq_pairs_test]
-    print(len(qa_dict_test))
-    with open(f'{path}test_kq_pairs.json', 'w') as json_file:
-        json.dump(qa_dict_test, json_file)
+    kq_pairs_test = generate_kq_pairs(test_data, history_tail=args.history_tail)
+    qa_dict_test = [
+        {
+            "key": key,
+            "query": query,
+            "traj_id": traj_id,
+            "user_id": int(str(traj_id).split("_", 1)[0]) if str(traj_id).split("_", 1)[0].isdigit() else None,
+            "start_time": start,
+            "end_time": end,
+        }
+        for key, query, traj_id, start, end in kq_pairs_test
+    ]
+    with (out_dir / "test_kq_pairs.json").open("w", encoding="utf-8") as json_file:
+        json.dump(qa_dict_test, json_file, ensure_ascii=False)
+    print(f"[info] wrote {len(qa_dict_test)} test K/Q pairs")
 
 
 if __name__ == "__main__":
     main()
-

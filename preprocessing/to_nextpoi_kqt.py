@@ -1,81 +1,11 @@
-import pandas as pd
-import json
 import argparse
 import io
-import pandas as pd
 import json
-import sys
-import math
+from pathlib import Path
+
+import pandas as pd
 from tqdm import tqdm
 
-
-
-
-def generate_qa_pairs(main_data, kqt=None, historical_data=None, args=None):
-    # Sort the dataframe by UserId, pseudo_session_trajectory_id, and timestamp
-    main_data = main_data.sort_values(by=['UserId', 'pseudo_session_trajectory_id', 'UTCTimeOffsetEpoch'])
-
-    # List to store the QA pairs
-    qa_pairs = []
-
-    # Iterate over each user
-    for user in tqdm(main_data['UserId'].unique()):
-        user_data = main_data[main_data['UserId'] == user]
-
-        # Iterate over each unique trajectory for the user based on 'pseudo_session_trajectory_id'
-        for traj_id in user_data['pseudo_session_trajectory_id'].unique():
-            user_trajectory_data = user_data[user_data['pseudo_session_trajectory_id'] == traj_id]
-
-            # Get the start time of the current trajectory
-            start_time_of_current_traj = user_trajectory_data['UTCTimeOffsetEpoch'].min()
-
-            num_traj = user_trajectory_data.shape[-1]
-            if 'traj_id' in kqt.keys():
-                top200 = kqt['traj_id']
-                # Fetch historical data before the start of the current trajectory
-                if historical_data is not None:
-                    user_historical_data = historical_data[(str(historical_data['pseudo_session_trajectory_id']) in top200)].tail(200 - num_traj)
-                else:
-                    user_historical_data = main_data[(str(main_data['pseudo_session_trajectory_id']) in top200)].tail(200 - num_traj)
-            else:
-                if historical_data is not None:
-                    user_historical_data = historical_data[(historical_data['UserId'] == user) & (
-                            historical_data['UTCTimeOffsetEpoch'] < start_time_of_current_traj)].tail(600 - num_traj)
-                else:
-                    user_historical_data = user_data[
-                        (user_data['UTCTimeOffsetEpoch'] < start_time_of_current_traj)].tail(
-                        600 - num_traj)
-            user_trajectory_data.reset_index(drop=True, inplace=True)
-            # Create the question based on the current trajectory (excluding the last entry) and historical data
-            question_parts = [f"<question>: The following data is a trajectory of user {user}:"]
-            for i, row in user_trajectory_data.iloc[:-1].iterrows():
-                if i > 0:
-                    question_parts.append(
-                        f"At {row['UTCTimeOffset']}, user {user} visited POI id {row['PoiId']} which is a {row['PoiCategoryName']} and has Category id {row['PoiCategoryId']}.")
-                else:
-                    question_parts = [f"<question>: The following data is a trajectory of user {user}:"]
-                    question_parts.append(
-                        f"At {row['UTCTimeOffset']}, user {user} visited POI id {row['PoiId']} which is a {row['PoiCategoryName']} and has Category id {row['PoiCategoryId']}.")
-            if not user_historical_data.empty:
-                if len(user_trajectory_data.iloc[:-1]) > 0:
-                    question_parts.append("There is also historical data:")
-                else:
-                    question_parts = [f"There is historical data for user {user}:"]
-                for _, row in user_historical_data.iterrows():
-                    question_parts.append(
-                        f"At {row['UTCTimeOffset']}, user {row['UserId']} visited POI id {row['PoiId']} which is a {row['PoiCategoryName']} and has Category id {row['PoiCategoryId']}.")
-
-            # Create the final question string
-            question = " ".join(question_parts)
-            value = {'NYC': 4981, 'TKY': 7833, 'CA': 9690}[args.dataset_name]
-            question += f" Given the data, At {user_trajectory_data.iloc[-1]['UTCTimeOffset']}, Which POI id will user {user} visit? Note that POI id is an integer in the range from 0 to {value}."
-
-            # Form the answer based on the last entry of the current trajectory
-            answer = f"<answer>: At {user_trajectory_data.iloc[-1]['UTCTimeOffset']}, user {user} will visit POI id {user_trajectory_data.iloc[-1]['PoiId']}."
-
-            # Append the question-answer pair to the list
-            qa_pairs.append((question, answer))
-    return qa_pairs
 
 def _make_r_io_base(f, mode: str):
     if not isinstance(f, io.IOBase):
@@ -84,48 +14,132 @@ def _make_r_io_base(f, mode: str):
 
 
 def jload(f, mode="r"):
-    """Load a .json file into a dictionary."""
     f = _make_r_io_base(f, mode)
     jdict = json.load(f)
     f.close()
     return jdict
 
 
+def prepare_dataframe(path):
+    data = pd.read_csv(path)
+    data["UTCTimeOffset"] = pd.to_datetime(data["UTCTimeOffset"])
+    if "UTCTimeOffsetEpoch" not in data.columns:
+        data["UTCTimeOffsetEpoch"] = data["UTCTimeOffset"].astype("int64") // 1_000_000_000
+    if "PoiCategoryId" not in data.columns:
+        data["PoiCategoryId"] = pd.factorize(data["PoiCategoryName"].astype(str))[0]
+    return data
+
+
+def poi_hint(data):
+    ids = data["PoiId"].astype(str).str.strip()
+    if ids.str.fullmatch(r"[0-9a-fA-F]{24}").all():
+        return "Note that POI id is a 24-character hexadecimal identifier. Return only the POI id."
+    if ids.str.fullmatch(r"\d+").all():
+        numeric = ids.astype(int)
+        return f"Note that POI id is an integer in the range from {numeric.min()} to {numeric.max()}. Return only the POI id."
+    return "Return only the POI id exactly as it appears in the data."
+
+
+def generate_qa_pairs(main_data, kqt=None, historical_data=None, args=None):
+    # This keeps the original KQT prompt construction, but fixes the lookup and
+    # filtering bugs so top similar trajectories are actually used.
+    main_data = main_data.sort_values(by=["UserId", "pseudo_session_trajectory_id", "UTCTimeOffsetEpoch"])
+    qa_pairs = []
+    kqt = kqt or {}
+    hint = poi_hint(pd.concat([main_data, historical_data], ignore_index=True) if historical_data is not None else main_data)
+
+    for user in tqdm(main_data["UserId"].unique(), desc="Generating KQT QA", unit="user"):
+        user_data = main_data[main_data["UserId"] == user]
+        for traj_id in user_data["pseudo_session_trajectory_id"].unique():
+            user_trajectory_data = user_data[user_data["pseudo_session_trajectory_id"] == traj_id].copy()
+            if len(user_trajectory_data) < 2:
+                continue
+
+            start_time = user_trajectory_data["UTCTimeOffsetEpoch"].min()
+            top_ids = [str(item) for item in kqt.get(str(traj_id), [])]
+            current_len = len(user_trajectory_data)
+
+            if top_ids:
+                source_data = historical_data if historical_data is not None else main_data
+                user_historical_data = source_data[
+                    source_data["pseudo_session_trajectory_id"].astype(str).isin(top_ids)
+                    & (source_data["UTCTimeOffsetEpoch"] < start_time)
+                ].tail(max(0, 200 - current_len))
+            elif historical_data is not None:
+                user_historical_data = historical_data[
+                    (historical_data["UserId"] == user) & (historical_data["UTCTimeOffsetEpoch"] < start_time)
+                ].tail(max(0, 600 - current_len))
+            else:
+                user_historical_data = user_data[user_data["UTCTimeOffsetEpoch"] < start_time].tail(max(0, 600 - current_len))
+
+            user_trajectory_data.reset_index(drop=True, inplace=True)
+            question_parts = [f"<question>: The following data is a trajectory of user {user}:"]
+            for _, row in user_trajectory_data.iloc[:-1].iterrows():
+                question_parts.append(
+                    f"At {row['UTCTimeOffset']}, user {user} visited POI id {row['PoiId']} "
+                    f"which is a {row['PoiCategoryName']} and has Category id {row['PoiCategoryId']}."
+                )
+
+            if not user_historical_data.empty:
+                question_parts.append("There is also historical data:")
+                for _, row in user_historical_data.iterrows():
+                    question_parts.append(
+                        f"At {row['UTCTimeOffset']}, user {row['UserId']} visited POI id {row['PoiId']} "
+                        f"which is a {row['PoiCategoryName']} and has Category id {row['PoiCategoryId']}."
+                    )
+
+            target = user_trajectory_data.iloc[-1]
+            question = " ".join(question_parts)
+            question += f" Given the data, At {target['UTCTimeOffset']}, Which POI id will user {user} visit? {hint}"
+            answer = f"<answer>: At {target['UTCTimeOffset']}, user {user} will visit POI id {target['PoiId']}."
+            qa_pairs.append((question, answer))
+
+    return qa_pairs
+
+
+def resolve_paths(args):
+    if args.data_dir:
+        data_dir = Path(args.data_dir)
+    else:
+        data_dir = Path("..") / "datasets" / args.dataset_name / "preprocessed"
+    train_csv = Path(args.train_csv) if args.train_csv else data_dir / "train_sample.csv"
+    test_csv = Path(args.test_csv) if args.test_csv else data_dir / "test_sample_with_traj.csv"
+    out_dir = Path(args.out_dir) if args.out_dir else data_dir
+    return train_csv, test_csv, out_dir
+
+
 def main():
-    # Create the argument parser
-    parser = argparse.ArgumentParser(description="Process dataset names.")
-
-    # Add an argument for the dataset name
-    parser.add_argument("-dataset_name", type=str, choices=['ca', 'nyc', 'tky'],
-                        help="Name of the dataset (e.g., ca, nyc, tky)")
-
-    # Parse the arguments
+    parser = argparse.ArgumentParser(description="Generate original KQT next-POI QA files.")
+    parser.add_argument("-dataset_name", "--dataset_name", type=str, choices=["ca", "nyc", "tky"], required=True)
+    parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--train_csv", type=str, default=None)
+    parser.add_argument("--test_csv", type=str, default=None)
+    parser.add_argument("--out_dir", type=str, default=None)
     args = parser.parse_args()
 
-    # Your processing code here
-    print(f"Processing dataset: {args.dataset_name}")
-    path = f'../datasets/{args.dataset_name}/preprocessed/'
-    # Read the data
-    train_data = pd.read_csv(f'{path}train_sample.csv')
-    test_data = pd.read_csv(f'{path}test_sample_with_traj.csv')
-    kqt1 = jload(f'{path}train_key_top200.json')
-    kqt2 = jload(f'{path}test_key_top200.json')
-    # Generate the QA pairs
-    qa_pairs_train = generate_qa_pairs(train_data, kqt=kqt1, historical_data=train_data, args=args)
-    qa_pairs_test = generate_qa_pairs(test_data, kqt=kqt2, historical_data=train_data, args=args)
+    train_csv, test_csv, out_dir = resolve_paths(args)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    train_data = prepare_dataframe(train_csv)
+    test_data = prepare_dataframe(test_csv)
+    kqt_train = jload(out_dir / "train_key_top200.json")
+    kqt_test = jload(out_dir / "test_key_top200.json")
 
-    # Save the train QA pairs in JSON format
+    qa_pairs_train = generate_qa_pairs(train_data, kqt=kqt_train, historical_data=train_data, args=args)
+    qa_pairs_test = generate_qa_pairs(test_data, kqt=kqt_test, historical_data=train_data, args=args)
+
     qa_dict_train = [{"question": q, "answer": a} for q, a in qa_pairs_train]
-    with open(f'{path}train_qa_pairs_kqt.json', 'w') as json_file:
-        json.dump(qa_dict_train, json_file)
+    with (out_dir / "train_qa_pairs_kqt.json").open("w", encoding="utf-8") as json_file:
+        json.dump(qa_dict_train, json_file, ensure_ascii=False)
+    print(f"[info] wrote {len(qa_dict_train)} train QA pairs")
 
-
-    # Save the test QA pairs in TXT format
-    with open(f'{path}test_qa_pairs_kqt.txt', 'w') as txt_file:
+    qa_dict_test = [{"question": q, "answer": a} for q, a in qa_pairs_test]
+    with (out_dir / "test_qa_pairs_kqt.json").open("w", encoding="utf-8") as json_file:
+        json.dump(qa_dict_test, json_file, ensure_ascii=False)
+    with (out_dir / "test_qa_pairs_kqt.txt").open("w", encoding="utf-8") as txt_file:
         for q, a in qa_pairs_test:
-            txt_file.write(q + a + '\n')
+            txt_file.write(q + a + "\n")
+    print(f"[info] wrote {len(qa_dict_test)} test QA pairs")
 
 
 if __name__ == "__main__":
     main()
-
